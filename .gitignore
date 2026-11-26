@@ -1,0 +1,16 @@
+data/
+**/data/
+.env
+.env.*
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.sqlite*
+*.db
+*.log
+*.pem
+*.key
+.DS_Store
+backups/
+exports/
