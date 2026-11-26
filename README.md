@@ -85,6 +85,8 @@ Windows 使用 `py -3 -m venv .venv` 创建环境，使用 `.venv\Scripts\activa
 
 旧版如果只显示 arXiv 和 alphaXiv，更新代码并重启服务后会一次性补齐 Hugging Face；已有的 Hugging Face 配置和暂停状态会保留，之后手动删除也不会每次启动都重新添加。
 
+热点来源的“每日采集”不等于每天都有新论文。Hugging Face 提供[按日期查询的官方接口](https://huggingface.co/docs/huggingface_hub/en/package_reference/hf_api#huggingface_hub.HfApi.list_daily_papers)，但某些日期列表可能为空；本项目读取最近的 Daily Papers 列表并去重。alphaXiv 当前使用网页结构化数据，榜单可能包含旧论文，并非当天新发表论文清单；其 [robots.txt](https://www.alphaxiv.org/robots.txt) 对带查询参数的首页有限制，现有 Trending 地址属于该范围，不能视为稳定、获准的自动采集接口。建议暂停该来源，使用网站查看，等待官方支持的接入方式。访问失败不代表当天没有热点论文。
+
 没有 API 密钥也可以启动空白工作台；AI 功能需要自行配置。本项目不附带任何作者的账号或 API 额度。
 
 高级用户可通过 `SUMMARY_API_KEY`、`SUMMARY_BASE_URL`、`SUMMARY_MODEL` 环境变量配置主模型。这些环境变量优先于页面配置。不要把真实密钥写入仓库或提交记录；也不要把密钥填写到 API 地址中。
