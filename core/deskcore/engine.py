@@ -323,6 +323,13 @@ def init():
             c.execute("UPDATE sources SET name='alphaXiv · 全领域热点',query='all' WHERE workspace='research' AND type='alphaxiv' AND query='sound,audio-and-speech-processing'")
             c.execute("UPDATE discoveries SET name='alphaXiv · 全领域热点' WHERE source_id IN (SELECT id FROM sources WHERE type='alphaxiv' AND query='all')")
             c.execute("INSERT INTO app_meta VALUES('alphaxiv_global_v1','1')")
+        # One-time backfill for standalone installs that omitted the HF source.
+        # Preserve existing (including paused/customized) sources and later removals.
+        if not c.execute("SELECT 1 FROM app_meta WHERE key='hf_daily_seeded_v1'").fetchone():
+            if not c.execute("SELECT 1 FROM sources WHERE workspace='research' AND type='hf'").fetchone():
+                c.execute("INSERT OR IGNORE INTO sources(id,name,type,query,kind,workspace,source_group) VALUES(?,?,?,?,?,?,?)",
+                          (uid('research:hf:daily'),'Hugging Face · 热点论文','hf','daily','paper','research','hot'))
+            c.execute("INSERT INTO app_meta VALUES('hf_daily_seeded_v1','1')")
         c.executescript('''CREATE TABLE IF NOT EXISTS topic_library(name TEXT PRIMARY KEY, created TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS topic_aliases(alias TEXT PRIMARY KEY, topic TEXT NOT NULL REFERENCES topic_library(name));
         CREATE TABLE IF NOT EXISTS item_topics(item TEXT NOT NULL, topic TEXT NOT NULL REFERENCES topic_library(name), PRIMARY KEY(item,topic));
