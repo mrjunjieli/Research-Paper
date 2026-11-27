@@ -38,7 +38,7 @@ JOBS = {}
 CANCELLED = set()   # job ids the user asked to stop; workers check before and during long loops
 LOCK = threading.RLock()
 CODEX_LOCK = threading.Lock()
-DEFAULT = {'api_model_overrides':{},'api_protocol':'auto','ai_engine':'api', 'api_effort':'default', 'api_reasoning_mode':'auto', 'api_effort_mapping':'', 'codex_model':'gpt-6.1-sol', 'codex_effort':'high', 'base_url':'https://api.deepseek.com', 'model':'deepseek-flash', 'api_key':'', 'scholar_key':'', 'search_provider':'academic', 'search_api_key':'', 'auto_refresh':False, 'daily_time':'08:30', 'max_items':50, 'auto_review':True, 'daily_limit':50, 'hot_limit':10, 'interest_topics':'声学, 语音, 音频, 音乐', 'auto_screen':True, 'vision_base_url':'', 'vision_model':'', 'vision_protocol':'auto', 'vision_api_key':''}
+DEFAULT = {'api_model_overrides':{},'api_protocol':'auto','ai_engine':'api', 'api_effort':'default', 'api_reasoning_mode':'auto', 'api_effort_mapping':'', 'codex_model':'gpt-6.1-sol', 'codex_effort':'high', 'base_url':'https://api.deepseek.com', 'model':'deepseek-flash', 'api_key':'', 'scholar_key':'', 'search_provider':'academic', 'search_api_key':'', 'auto_refresh':False, 'daily_time':'08:30', 'max_items':50, 'auto_review':True, 'daily_limit':50, 'hot_limit':10, 'interest_topics':'声学, 语音, 音频, 音乐', 'auto_screen':True, 'vision_base_url':'', 'vision_model':'', 'vision_protocol':'auto', 'vision_api_key':'', 'followed_limit':20}
 API_PROVIDERS = [
     {'id':'deepseek','name':'DeepSeek','base_url':'https://api.deepseek.com','models':['deepseek-flash','deepseek-pro']},
     {'id':'openai','name':'OpenAI 官方','base_url':'https://api.openai.com/v1','models':['gpt-6.1-sol','gpt-6-astra','gpt-5.3-codex']},
@@ -257,9 +257,6 @@ def conn():
 
 def init():
     from deskcore import hooks
-    for fn in hooks.INIT:
-        try: fn(enrichment_desk())
-        except Exception as exc: hooks.record_failure('init', exc)
     with conn() as c:
         c.executescript('''
         CREATE TABLE IF NOT EXISTS items(id TEXT PRIMARY KEY, kind TEXT NOT NULL, title TEXT NOT NULL, url TEXT DEFAULT '', published TEXT DEFAULT '', added TEXT NOT NULL, body TEXT DEFAULT '', coverage TEXT DEFAULT 'manual', source TEXT DEFAULT '', authors TEXT DEFAULT '[]', tags TEXT DEFAULT '[]', status TEXT DEFAULT 'unread', starred INTEGER DEFAULT 0, notes TEXT DEFAULT '', summary TEXT, external_id TEXT DEFAULT '', citations INTEGER, citation_source TEXT DEFAULT '', citation_updated TEXT DEFAULT '');
@@ -291,6 +288,7 @@ def init():
         CREATE TABLE IF NOT EXISTS collection_events(id INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT,item TEXT,title TEXT,external_id TEXT,source_id TEXT,source_name TEXT,found TEXT,outcome TEXT);
         CREATE INDEX IF NOT EXISTS collection_events_day ON collection_events(found);
         CREATE TABLE IF NOT EXISTS collection_identities(identity TEXT PRIMARY KEY,item TEXT,first_seen TEXT);
+        CREATE TABLE IF NOT EXISTS recommendation_suppressions(item TEXT PRIMARY KEY,reason TEXT NOT NULL,created TEXT NOT NULL);
         """)
         # Seed durable identities, not fabricated historical collection events.
         for r in c.execute("SELECT id,title,url,external_id,added FROM items WHERE workspace='research' AND kind='paper'").fetchall():
@@ -357,6 +355,10 @@ def init():
     ENRICH.initialize(enrichment_desk())
     with conn() as c:c.execute("CREATE TABLE IF NOT EXISTS paper_work(item TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER DEFAULT 0, updated TEXT NOT NULL, retry_at TEXT DEFAULT '', error TEXT DEFAULT '', PRIMARY KEY(item,kind))")
     migrate_screening_cache()
+    # 项目建表依赖内核的表（profiles、sources 等），所以放在内核结构之后。
+    for fn in hooks.INIT:
+        try: fn(enrichment_desk())
+        except Exception as exc: hooks.record_failure('init', exc)
 
 def codex_binary():
     return shutil.which('codex') or next((str(p) for p in [Path('/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex')] if p.is_file()),None)
@@ -707,7 +709,10 @@ def add_item(v):
         if v.get('_collection_run') and (prior or historical):
             iid=prior['id'] if prior else historical['item']
             for key in keys:c.execute('INSERT OR IGNORE INTO collection_identities VALUES(?,?,?)',(key,iid,now()))
-            c.execute('INSERT OR REPLACE INTO discoveries VALUES(?,?,?,?,?)',(iid,v['source_id'],v['source'],v.get('source_group','manual'),now()))
+            # Author discovery must not promote a previously screened/handled paper
+            # into a new author recommendation or change its original source group.
+            if v.get('source_group')!='followed':
+                c.execute('INSERT OR REPLACE INTO discoveries VALUES(?,?,?,?,?)',(iid,v['source_id'],v['source'],v.get('source_group','manual'),now()))
             if v.get('heat'):c.execute('INSERT OR REPLACE INTO paper_heat VALUES(?,?)',(iid,json.dumps(v['heat'])))
             record_collection(c,v,iid,title,ext,'duplicate')
             return iid,False
@@ -1089,10 +1094,37 @@ def migrate_screening_cache():
             if row['fingerprint'] in {uid(screening_material(p,cfg)+json.dumps(ctx,ensure_ascii=False)) for ctx in contexts}:
                 c.execute('UPDATE paper_screenings SET fingerprint=? WHERE item=?',(screening_fingerprint(p,cfg),p['id']))
 
+def publication_window_reason(published, at=None, days=7):
+    """Require a full, verifiable publication date; discovery time is not publication."""
+    try:
+        if not isinstance(published,str) or not re.match(r'^\d{4}-\d{2}-\d{2}(?:T|$| )',published):
+            return '缺少可确认的发表日期，暂不推荐'
+        stamp=dt.datetime.fromisoformat((at or now()).replace('Z','+00:00'))
+        if stamp.tzinfo is None:stamp=stamp.replace(tzinfo=dt.timezone(dt.timedelta(hours=8)))
+        date=dt.datetime.fromisoformat(published.replace('Z','+00:00'))
+        if date.tzinfo is None:date=date.replace(tzinfo=dt.timezone.utc)
+        age=(stamp-date).total_seconds()
+        if age<0:return '发表时间在未来，暂不推荐'
+        if age>days*86400:return '发表时间超过最近7天，暂不推荐'
+    except (ValueError,TypeError,OverflowError):
+        return '缺少可确认的发表日期，暂不推荐'
+    return ''
+
 def assess_candidate(p,cfg):
     groups={d['source_group'] for d in p['discoveries']}
-    group='field' if 'field' in groups else 'hot' if 'hot' in groups else 'manual'
+    group='followed' if 'followed' in groups else 'field' if 'field' in groups else 'hot' if 'hot' in groups else 'manual'
     out={'eligible':False,'group':group,'reason':'','status':'excluded','score':0}
+    if group=='followed':
+        # Following bypasses topic screening only, never freshness or history checks.
+        if p['removed']: out['reason']='已明确标记不感兴趣'; return out
+        if p.get('starred') or p.get('seen_at') or p.get('status')=='read': out['reason']='已收藏或已读，留在论文库'; return out
+        reason=publication_window_reason(p.get('published'))
+        if reason:out['reason']=reason;return out
+        # 作者自己发的论文不因摘要短就丢掉，只要有标题和一点内容就推荐。
+        if len(p['title'].strip())<12 or len(p['body'].strip())<40: out['reason']='材料不足，暂不能初审'; return out
+        names='、'.join(sorted({d['name'].split('·')[-1].strip() for d in p['discoveries'] if d['source_group']=='followed'}))
+        out.update(eligible=True,status='followed',reason='关注的作者'+(('：'+names) if names else ''),score=.95)
+        return out
     if not any(d['source_group'] in ['field','hot'] for d in p['discoveries']): out['reason']='仅从 arXiv 与热点来源推荐'; return out
     if p['removed']: out['reason']='已明确标记不感兴趣'; return out
     if p.get('seen_at'): out['reason']='已标为已读，留在论文库'; return out
@@ -1148,15 +1180,16 @@ def daily_recommendations(papers=None,admit_during_collection=False,read_only=Fa
     with conn() as c:
         screened={r['item']:dict(r) for r in c.execute('SELECT * FROM paper_screenings')}
         already_admitted={r['item'] for r in c.execute('SELECT item FROM recommendation_inbox')}
+        suppressed={r['item'] for r in c.execute('SELECT item FROM recommendation_suppressions')}
         translations={r['key'][13:]:json.loads(r['value']) for r in c.execute("SELECT key,value FROM app_meta WHERE key LIKE 'screening-en:%'")}
     candidates=[]; exclusions=collections.Counter(); pending=0; reviewed=0
     for p in papers:
-        if p['kind']!='paper' or p['id'] in already_admitted: continue
+        if p['kind']!='paper' or p['id'] in already_admitted or p['id'] in suppressed: continue
         if reading_advice_holds(p):exclusions['全文评估暂不推荐']+=1;continue
         a=assess_candidate(p,cfg)
         if not a['eligible']: exclusions[a['reason']]+=1; continue
         review=screened.get(p['id'])
-        if ai_ready(cfg) and cfg['auto_screen']:
+        if ai_ready(cfg) and cfg['auto_screen'] and a['status']!='followed':
             if not review or review['fingerprint']!=screening_fingerprint(p,cfg):
                 pending+=1; exclusions['等待 AI 初审']+=1; continue
             reviewed+=1
@@ -1172,17 +1205,36 @@ def daily_recommendations(papers=None,admit_during_collection=False,read_only=Fa
     with conn() as c:
         if not read_only:c.execute('BEGIN IMMEDIATE')
         ledger={r['item']:dict(r) for r in c.execute('SELECT * FROM recommendation_inbox')}
-        admitted=[r for r in ledger.values() if r['recommended_date']==today]
-        room=max(0,cfg['daily_limit']-len(admitted)); hot_room=max(0,cfg['hot_limit']-sum(r['source_group']=='hot' for r in admitted))
+        delivered_keys={r['identity'] for r in c.execute('SELECT identity FROM collection_identities WHERE item IN (SELECT item FROM recommendation_inbox)')}
+        for old in c.execute("SELECT title,external_id,url FROM items WHERE id IN (SELECT item FROM recommendation_inbox)"):
+            delivered_keys.update(collection_keys(old['title'],old['external_id'],old['url']))
+        admitted=[r for r in ledger.values() if r['recommended_date']==today and r['item'] not in suppressed]
+        # 收藏的作者有独立配额，不占每日 50 篇，也不影响热点名额。
+        room=max(0,cfg['daily_limit']-len([r for r in admitted if r['source_group']!='followed']))
+        hot_room=max(0,cfg['hot_limit']-sum(r['source_group']=='hot' for r in admitted))
+        followed_limit=max(0,int(cfg.get('followed_limit',20)))
+        followed_room=max(0,followed_limit-len([r for r in admitted if r['source_group']=='followed']))
         for p in ([] if read_only else candidates):
-            if not room: break
-            if p['id'] in ledger or p['daily_group']=='hot' and not hot_room: continue
+            followed=p['daily_group']=='followed'
+            if followed:
+                if not followed_room: continue
+            elif not room: continue
+            if p['id'] in ledger or (p['daily_group']=='hot' and not hot_room): continue
+            identity_keys=set(collection_keys(p['title'],p.get('external_id',''),p.get('url','')))
+            if identity_keys & delivered_keys:
+                exclusions['历史已推荐同一论文']+=1
+                continue
             row={'item':p['id'],'recommended_date':today,'source_group':p['daily_group'],'reason':p['daily_reason'],'screening':p['daily_screening'],'score':p['daily_score']-.2*p.get('preference_score',0)}
             c.execute('INSERT INTO recommendation_inbox VALUES(?,?,?,?,?,?)',tuple(row.values()))
-            ledger[p['id']]=row; room-=1
-            if p['daily_group']=='hot': hot_room-=1
+            ledger[p['id']]=row
+            delivered_keys.update(identity_keys)
+            if followed: followed_room-=1
+            else:
+                room-=1
+                if p['daily_group']=='hot': hot_room-=1
     selected=[]; by_id={p['id']:p for p in papers}; groups=collections.defaultdict(list)
     for r in ledger.values():
+        if r['item'] in suppressed:continue
         p=by_id.get(r['item'])
         if not p: continue
         if reading_advice_holds(p):exclusions['全文评估暂不推荐']+=1;continue
@@ -1201,7 +1253,7 @@ def daily_recommendations(papers=None,admit_during_collection=False,read_only=Fa
         sources=collections.Counter(r['source_group'] for p,r in entries)
         batches.append({'date':date,'total':len(entries),'remaining':remaining,'counts':dict(sources),'topics':[{'name':t,'count':n} for t,n in topics_count.most_common(6)]})
     today_batch=next((x for x in batches if x['date']==today),{'date':today,'total':0,'remaining':0,'counts':{},'topics':[]})
-    return {'date':today,'limit':cfg['daily_limit'],'hot_limit':cfg['hot_limit'],'items':selected,'counts':dict(collections.Counter(p['daily_group'] for p in selected)),'today':today_batch,'delivery_today':DELIVERY.history(enrichment_desk())[0],'backlog':[b for b in batches if b['date']<today and b['remaining']],'batches':batches,'qualified':len(candidates),'pending':pending,'reviewed':reviewed,'excluded':dict(exclusions),'mode':'ai' if ai_ready(cfg) and cfg['auto_screen'] else 'rules','topics':cfg['interest_topics']}
+    return {'date':today,'limit':cfg['daily_limit'],'hot_limit':cfg['hot_limit'],'followed_limit':cfg.get('followed_limit',20),'items':selected,'counts':dict(collections.Counter(p['daily_group'] for p in selected)),'today':today_batch,'delivery_today':DELIVERY.history(enrichment_desk())[0],'backlog':[b for b in batches if b['date']<today and b['remaining']],'batches':batches,'qualified':len(candidates),'pending':pending,'reviewed':reviewed,'excluded':dict(exclusions),'mode':'ai' if ai_ready(cfg) and cfg['auto_screen'] else 'rules','topics':cfg['interest_topics']}
 
 
 def screen_daily_candidates():
@@ -1557,17 +1609,23 @@ def worker():
                 JOBS[jid].update(state='error' if failed and not successful else 'done',message=message,result=result)
             elif JOBS[jid]['kind'] in ['每周引用更新','每日引用更新'] and isinstance(result,dict):
                 JOBS[jid].update(state='error' if result.get('failed') else 'done',message=result['message'],result=result)
+            elif JOBS[jid]['kind']=='关注作者新论文' and isinstance(result,dict):
+                JOBS[jid].update(state='error' if result.get('failed') else 'done',message=result['message'],result=result)
             else:
                 JOBS[jid].update(state='done',message='已收藏，后台自动解析' if JOBS[jid]['kind']=='链接导入论文' else '完成',result=result)
                 if JOBS[jid]['kind']=='链接导入论文' and isinstance(result,dict):JOBS[jid]['item_id']=result.get('id')
         except Exception as e: JOBS[jid].update(state='error',message=str(e))
-        finally: TASKS.task_done()
+        finally:
+            if JOBS[jid]['kind'] in ['每周引用更新','每日引用更新']:
+                try: persist_citation_task(JOBS[jid])
+                except Exception: pass  # A history write failure must not stop the worker.
+            TASKS.task_done()
 
 def refresh_all(workspace=None,resume=False,stop=None):
     return DELIVERY.collect(enrichment_desk(),lambda w:_refresh_all(w,resume,stop),workspace)
 
 def _refresh_all(workspace=None,resume=False,stop=None):
-    with conn() as c: ss=[dict(r) for r in c.execute('SELECT * FROM sources WHERE enabled=1'+(' AND workspace=?' if workspace else ''),(workspace,) if workspace else ())]
+    with conn() as c: ss=[dict(r) for r in c.execute("SELECT * FROM sources WHERE enabled=1 AND type<>'followed'"+(' AND workspace=?' if workspace else ''),(workspace,) if workspace else ())]
     results=[]
     for s in ss:
         if stop and stop():
@@ -1607,6 +1665,7 @@ def scheduler():
         time.sleep(30)
         recover_missing_paper_work()
         enqueue_citation_refresh()
+        check_followed_due()
         for workspace in ['research','news']:
             cfg=settings(workspace=workspace); date=now()[:10]; minute=now()[11:16]
             marker=DATA/('last-refresh-'+workspace+'.txt')
@@ -2025,7 +2084,7 @@ def author_list(workspace=None,library_only=False,papers=None):
         aliases=collections.defaultdict(list)
         for r in c.execute('SELECT alias,canonical FROM author_aliases'):aliases[r['canonical']].append(r['alias'])
         reports={r['author']:dict(r) for r in c.execute('SELECT * FROM reports')}
-        follows={r['author']:dict(r) for r in c.execute('SELECT * FROM followed_authors')} if workspace in [None,'research'] else {}
+        follows={r['author']:dict(r) for r in c.execute('SELECT * FROM author_follows')} if workspace in [None,'research'] else {}
     result=[]
     for p in profiles:
         if not contributions[p['id']]: continue
@@ -2033,6 +2092,21 @@ def author_list(workspace=None,library_only=False,papers=None):
         if p['report']: p['report']['item_ids']=json.loads(p['report']['item_ids'])
         result.append(p)
     return sorted(result,key=lambda p:(-p['count'],p['name'].casefold()))
+
+
+def public_task_details(result):
+    if not isinstance(result,dict) or not isinstance(result.get('details'),list): return []
+    keys=('item_id','status','reason','retry_at','citations')
+    return [{k:d[k] for k in keys if k in d} for d in result['details'][:5000] if isinstance(d,dict)]
+
+
+def persist_citation_task(job):
+    record={k:job.get(k) for k in ('id','kind','state','message','started','workspace','item_id')}
+    record['details']=public_task_details(job.get('result'))
+    with conn() as c:
+        c.execute('INSERT OR REPLACE INTO app_meta(key,value) VALUES(?,?)',('citation_task:'+job['id'],json.dumps(record,ensure_ascii=False)))
+        old=c.execute("SELECT key FROM app_meta WHERE key LIKE 'citation_task:%' ORDER BY json_extract(value,'$.started') DESC LIMIT -1 OFFSET 100").fetchall()
+        c.executemany('DELETE FROM app_meta WHERE key=?',[(row['key'],) for row in old])
 
 
 def task_message_version(job):
@@ -2052,6 +2126,10 @@ def task_center(include_dismissed=False):
     records={}
     with conn() as c:
         dismissed={r['key'][len('dismissed_task:'):]:r['value'] for r in c.execute("SELECT key,value FROM app_meta WHERE key LIKE 'dismissed_task:%'")}
+        for stored in c.execute("SELECT value FROM app_meta WHERE key LIKE 'citation_task:%'"):
+            try:
+                record=json.loads(stored['value']);records[record['id']]=record
+            except (ValueError,KeyError,TypeError):pass
         titles={r['id']:{'title':r['title'],'workspace':r['workspace']} for r in c.execute('SELECT id,title,workspace FROM items')}
         for row in c.execute('SELECT * FROM paper_work ORDER BY updated DESC LIMIT 200'):
             jid='paper-'+row['kind']+'-'+row['item']
@@ -2061,8 +2139,12 @@ def task_center(include_dismissed=False):
         # Durable state wins after a recovery run or another worker updates the job.
         if old and old['state']!=j.get('state'):continue
         records[j['id']]={**old,**{k:j.get(k) for k in ['id','kind','state','message','started','workspace','item_id']}}
+        if isinstance(j.get('result'),dict) and 'details' in j['result']:
+            records[j['id']]['details']=public_task_details(j['result'])
     for j in records.values():
         j['title']=titles.get(j.get('item_id'),{}).get('title','')
+        for d in j.get('details',[]):
+            d['title']=titles.get(d.get('item_id'),{}).get('title','')
         j['message_version']=task_message_version(j)
     records={jid:j for jid,j in records.items() if j['state'] in ['running','queued','error','done','cancelled']}
     if not include_dismissed:
@@ -2084,4 +2166,5 @@ def enqueue_citation_refresh(): return None
 def queue_collected_reviews(iids): return 0
 def refresh_recommended_authors(): return None
 def reconcile_author_profiles(): return {}
+def check_followed_due(): return None
 def review_pipeline(iid, defer_authors=False): raise ValueError('论文模块未安装')

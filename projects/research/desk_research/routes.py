@@ -1,7 +1,18 @@
 """Research project HTTP routes: author intelligence, citations, graph, paper queue."""
 from deskcore.engine import (ai_ready, author_list, conn, enqueue, LOCK, now,
                              settings, enrichment_desk, JOBS)
-from . import domain
+from . import domain, followed
+from deskcore import hooks
+from urllib.parse import urlencode
+
+def get_collection_view(handler,q):
+    # Previously copied AI links now open the same human-readable library page.
+    query=urlencode({k:v[0] for k,v in q.items() if k in ('folder','tag','status','source','author','q','focus','sort','name') and v})
+    handler.send_response(302)
+    handler.send_header('Location','/research#paper'+('?' + query if query else ''))
+    handler.send_header('Cache-Control','no-store')
+    handler.end_headers()
+    return hooks.RAW
 from . import research_directions as DIRECTIONS
 
 PROJECT = 'research'
@@ -71,7 +82,7 @@ def post_paper_chat(handler, v):
 def post_review(handler, v):
     if not ai_ready(settings(workspace=_ws(v))):
         raise ValueError('请先配置独立 AI Key，才能生成综合 Review。')
-    return _pending(v['id']) or enqueue('论文综合 Review', lambda: domain.review_pipeline(v['id']), 'research', v['id'])
+    return _pending(v['id'], ['论文综合 Review']) or enqueue('论文综合 Review', lambda: domain.review_pipeline(v['id']), 'research', v['id'])
 
 
 def post_author_metadata(handler, v):
@@ -117,3 +128,32 @@ def post_author_merge(handler, v):
     if _ws(v) != 'research':
         raise ValueError('作者合并只在 Research Paper 中可用')
     return domain.merge_authors(v)
+
+
+def post_citation_refresh(handler, v):
+    if _ws(v) != 'research': raise ValueError('引用检查仅适用于论文')
+    ids=v.get('ids')
+    if not isinstance(ids,list) or not 1<=len(ids)<=100 or not all(isinstance(i,str) for i in ids):
+        raise ValueError('请选择1至100篇文库论文')
+    return enqueue('每周引用更新', lambda: domain.refresh_citation_counts(ids), 'research')
+
+
+def get_followed(handler, q):
+    return followed.read(enrichment_desk())
+
+
+def post_followed(handler, v):
+    return followed.save(enrichment_desk(), v)
+
+
+def post_followed_check(handler, v):
+    desk = enrichment_desk()
+    ids = v.get('ids') or None
+    if ids is not None and (not isinstance(ids, list) or not all(isinstance(i, str) for i in ids)):
+        raise ValueError('请选择要检查的作者')
+    existing = next((j for j in list(JOBS.values()) if j.get('kind') == '关注作者新论文' and j['state'] in ['queued', 'running']), None)
+    if existing:
+        return existing
+    job = enqueue('关注作者新论文', lambda: followed.check(desk, ids), 'research')
+    JOBS[job['id']]['cancelable'] = False
+    return job

@@ -11,9 +11,10 @@ import urllib.request
 URL = 'https://api.semanticscholar.org/graph/v1/paper/batch?fields=citationCount,externalIds'
 
 class CitationLookupError(ValueError):
-    def __init__(self, message, retry_after=0):
+    def __init__(self, message, retry_after=0, status=None):
         super().__init__(message)
         self.retry_after = retry_after
+        self.status = status
 
 
 def retry_seconds(value):
@@ -45,9 +46,19 @@ def read_batch(ids, headers=None):
         except urllib.error.HTTPError as exc:
             status = exc.code
             wait = retry_seconds(exc.headers.get('Retry-After'))
+            # Only recognize this exact public API error; never expose raw bodies.
+            not_found = False
+            if status == 400:
+                try:
+                    body = exc.read(4096)
+                    not_found = json.loads(body).get('error') == 'No valid paper ids given'
+                except (ValueError, AttributeError, OSError):
+                    pass
             exc.close()
+            if not_found:
+                return [None for _ in ids]
             # No upstream response bodies or headers are included in diagnostics.
-            failure = CitationLookupError('引用接口返回 HTTP %s'%status, wait)
+            failure = CitationLookupError('引用接口返回 HTTP %s'%status, wait, status=status)
             if status not in (429, 500, 502, 503, 504) or wait > 30:
                 raise failure from None
             delay = max(delay, wait)

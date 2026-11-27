@@ -4,10 +4,26 @@ import hashlib
 import json
 import threading
 import time
+import re
+from urllib.parse import urlsplit
 
 _lock=threading.RLock()
 _snapshots={}
 _preferences={}
+
+
+def pdf_link(desk,item):
+    """A real PDF anchor: prefer local cache, otherwise the paper's public PDF."""
+    if item.get('kind')!='paper':return ''
+    iid=item['id']
+    if re.fullmatch(r'[a-f0-9]{20}',iid) and any(p.is_file() for p in (desk.DATA/'materials'/iid/'original.pdf',desk.DATA/(iid+'.pdf'))):
+        return '/paper-assets/'+iid+'/original.pdf'
+    ext=item.get('external_id','')
+    if re.fullmatch(r'arxiv:(?:\d{4}\.\d{4,5}|[A-Za-z.-]+/\d{7})(?:v\d+)?',ext):
+        return 'https://arxiv.org/pdf/'+ext[6:]
+    url=item.get('url','')
+    if urlsplit(url).scheme in ('http','https') and urlsplit(url).path.lower().endswith('.pdf'):return url
+    return ''
 
 
 def initialize(desk):
@@ -95,7 +111,7 @@ def cards(desk,workspace):
             item['topic_groups']={k:[r['name'] for r in topics[item['id']] if r['category']==k] for k in desk.TOPIC_CATEGORIES}
         else:item['topics']=item['tags']
         found=discovery_list(provenance[item['id']],source_types)
-        item.update(discoveries=found,heat=heat.get(item['id']),_detail_loaded=False,_incremental_collected=item['id'] in incremental)
+        item.update(discoveries=found,heat=heat.get(item['id']),_detail_loaded=False,_incremental_collected=item['id'] in incremental,pdf_url=pdf_link(desk,item))
         result.append(item)
     if workspace=='research':
         fields=['id','title','body','tags','topics','authors','feedback']
@@ -168,7 +184,7 @@ def detail(desk,workspace,iid):
     with _lock:
         cached=_snapshots.get((str(desk.DB),workspace))
         base=next((i for i in cached[2]['items'] if i['id']==iid),{}) if cached else {}
-    return {**base,**item,'_detail_loaded':True}
+    return {**base,**item,'_detail_loaded':True,'pdf_url':pdf_link(desk,item)}
 
 
 def author(desk,workspace,aid):

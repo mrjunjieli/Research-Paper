@@ -63,12 +63,12 @@ def recover_paper_work():
     for row in rows:
         jid='paper-'+row['kind']+'-'+row['item'];JOBS[jid]={'id':jid,'kind':PAPER_WORK_NAMES[row['kind']],'state':row['state'],'message':row['error'] or '重启后自动恢复处理','started':row['updated'],'workspace':'research','item_id':row['item']}
     # All still-recommended and explicitly saved/read papers with missing reports.
-    with conn() as c: missing=[r['id'] for r in c.execute("SELECT i.id FROM items i WHERE i.workspace='research' AND i.kind='paper' AND i.removed=0 AND (i.summary IS NULL OR i.summary='') AND (i.id IN (SELECT item FROM recommendation_inbox) OR i.starred=1 OR i.seen_at<>'')")]
+    with conn() as c: missing=[r['id'] for r in c.execute("SELECT i.id FROM items i WHERE i.workspace='research' AND i.kind='paper' AND i.removed=0 AND (i.summary IS NULL OR i.summary='') AND (i.id IN (SELECT item FROM recommendation_inbox WHERE item NOT IN (SELECT item FROM recommendation_suppressions)) OR i.starred=1 OR i.seen_at<>'')")]
     queue_collected_reviews(missing)
     # Author searches are independent of Review completion and restricted to the library.
     with conn() as c: saved=c.execute("SELECT id FROM items WHERE workspace='research' AND kind='paper' AND removed=0 AND (starred=1 OR seen_at<>'' OR status='read')").fetchall()
     for row in saved: queue_signature(row['id']);queue_library_authors(row['id'])
-    with conn() as c:recommended=c.execute('SELECT item FROM recommendation_inbox').fetchall()
+    with conn() as c:recommended=c.execute('SELECT item FROM recommendation_inbox WHERE item NOT IN (SELECT item FROM recommendation_suppressions)').fetchall()
     for row in recommended:queue_signature(row['item'])
 
 def paper_worker(kind):
@@ -97,10 +97,10 @@ def paper_worker(kind):
             if kind=='review':ENRICH.record(enrichment_desk(),row['item'],'error',stage=message,retry_at=retry)
 
 def queue_collected_reviews(iids):
-    if not ai_ready(settings(workspace='research')): return 0
+    if not settings(workspace='research').get('auto_review',True) or not ai_ready(settings(workspace='research')): return 0
     count=0
     with LOCK:
-        pending={j.get('item_id') for j in JOBS.values() if j['state'] in ['queued','running']}
+        pending={j.get('item_id') for j in list(JOBS.values()) if j.get('kind')=='论文综合 Review' and j['state'] in ['queued','running']}
         for iid in dict.fromkeys(iids):
             queue_signature(iid)
             with conn() as c: row=c.execute('SELECT kind,workspace,summary,removed,body FROM items WHERE id=?',(iid,)).fetchone()
@@ -110,6 +110,15 @@ def queue_collected_reviews(iids):
             else: enqueue_paper_work(iid,'review')
             pending.add(iid); count+=1
     return count
+
+def recover_missing_paper_work():
+    # The engine fallback is intentionally empty; recovery belongs to this module.
+    with conn() as c:
+        rows=c.execute("""SELECT i.id FROM items i WHERE i.workspace='research' AND i.kind='paper'
+            AND i.removed=0 AND (i.summary IS NULL OR i.summary='')
+            AND (i.id IN (SELECT item FROM recommendation_inbox WHERE item NOT IN (SELECT item FROM recommendation_suppressions)) OR i.starred=1 OR i.seen_at<>'')""").fetchall()
+    return queue_collected_reviews([r['id'] for r in rows])
+
 
 def background_review(iid):
     with conn() as c: row=c.execute('SELECT summary,removed FROM items WHERE id=?',(iid,)).fetchone()
@@ -513,41 +522,76 @@ def enqueue_citation_refresh():
             return enqueue('每周引用更新',refresh_citation_counts,'research')
 
 
-def refresh_citation_counts():
-    cfg=settings();rows=citation_refresh_candidates()
+def refresh_citation_counts(item_ids=None):
+    cfg=settings()
+    if item_ids is None:
+        rows=citation_refresh_candidates()
+    else:
+        if not isinstance(item_ids,list) or not 1<=len(item_ids)<=100 or not all(isinstance(i,str) for i in item_ids):
+            raise ValueError('请选择1至100篇文库论文')
+        with conn() as c:
+            rows=c.execute("SELECT id,external_id FROM items WHERE workspace='research' AND kind='paper' AND removed=0 AND (starred=1 OR seen_at<>'' OR status='read') AND external_id LIKE 'arxiv:%' AND id IN ("+','.join('?' for _ in item_ids)+')',item_ids).fetchall()
     headers={'x-api-key':cfg['scholar_key']} if cfg['scholar_key'] else {}
-    updated=0; missing=0; failures=0
+    updated=0; missing=0; failures=0; details=[]
+
+    def failure(row,exc,unattempted=False):
+        nonlocal failures
+        stamp=now(); delay=max(3*3600,getattr(exc,'retry_after',0))
+        retry=(dt.datetime.fromisoformat(stamp)+dt.timedelta(seconds=delay)).isoformat(timespec='seconds')
+        message=str(exc)[:250] if isinstance(exc,citation_transport.CitationLookupError) else '引用更新失败（'+type(exc).__name__+'）'
+        if unattempted: message='暂缓查询，前一请求失败：'+message
+        with conn() as c:c.execute('UPDATE items SET citation_checked=?,citation_error=?,citation_retry_at=? WHERE id=?',(stamp,message,retry,row['id']))
+        failures+=1;details.append({'item_id':row['id'],'status':'deferred' if unattempted else 'error','reason':message,'retry_at':retry})
+
+    def save(row,result):
+        nonlocal updated,missing
+        stamp=now()
+        count=result.get('citationCount') if isinstance(result,dict) else None
+        external=(result.get('externalIds') or {}).get('ArXiv') if isinstance(result,dict) else None
+        try: matches=not external or normalize_arxiv(external)==normalize_arxiv(row['external_id'][6:])
+        except (ValueError,TypeError,AttributeError): matches=False
+        if result is not None and (not isinstance(count,int) or isinstance(count,bool) or count<0 or not matches):
+            failure(row,citation_transport.CitationLookupError('返回的引用数据或论文编号不匹配，保留旧值'))
+            return
+        retry=(dt.datetime.fromisoformat(stamp)+dt.timedelta(days=1)).isoformat(timespec='seconds')
+        with conn() as c:
+            if result is not None:
+                c.execute("UPDATE items SET citations=?,citation_source='Semantic Scholar',citation_updated=?,citation_checked=?,citation_error='',citation_retry_at='' WHERE id=?",(count,stamp,stamp,row['id'])); updated+=1
+                details.append({'item_id':row['id'],'status':'done','reason':'引用数据已更新','citations':count})
+            else:
+                message='来源暂未收录或尚无可用引用数据'
+                c.execute('UPDATE items SET citation_checked=?,citation_error=?,citation_retry_at=? WHERE id=?',(stamp,message,retry,row['id'])); missing+=1
+                details.append({'item_id':row['id'],'status':'not_indexed','reason':message+'；不把未知引用量记为0','retry_at':retry})
+
     for start in range(0,len(rows),100):
-        batch=rows[start:start+100]
+        batch=rows[start:start+100]; stop_batch=False
         try:
-            ids=['ARXIV:'+normalize_arxiv(r['external_id'][6:]) for r in batch]
-            data=citation_transport.read_batch(ids,headers)
-            stamp=now()
-            retry=(dt.datetime.fromisoformat(stamp)+dt.timedelta(days=1)).isoformat(timespec='seconds')
-            with conn() as c:
-                for row,result in zip(batch,data):
-                    count=result.get('citationCount') if isinstance(result,dict) else None
-                    external=(result.get('externalIds') or {}).get('ArXiv') if isinstance(result,dict) else None
-                    try: matches=not external or normalize_arxiv(external)==normalize_arxiv(row['external_id'][6:])
-                    except (ValueError,TypeError,AttributeError): matches=False
-                    valid=isinstance(count,int) and not isinstance(count,bool) and count>=0 and matches
-                    if valid:
-                        c.execute("UPDATE items SET citations=?,citation_source='Semantic Scholar',citation_updated=?,citation_checked=?,citation_error='',citation_retry_at='' WHERE id=?",(count,stamp,stamp,row['id'])); updated+=1
-                    else:
-                        c.execute("UPDATE items SET citation_checked=?,citation_error='来源暂未收录或尚无可用引用数据',citation_retry_at=? WHERE id=?",(stamp,retry,row['id'])); missing+=1
-        except Exception as e:
-            stamp=now()
-            delay=max(3*3600,getattr(e,'retry_after',0))
-            retry=(dt.datetime.fromisoformat(stamp)+dt.timedelta(seconds=delay)).isoformat(timespec='seconds')
-            message=str(e)[:250] if isinstance(e,citation_transport.CitationLookupError) else '引用更新失败（'+type(e).__name__+'）'
-            with conn() as c:
-                c.executemany('UPDATE items SET citation_checked=?,citation_error=?,citation_retry_at=? WHERE id=?',[(stamp,message,retry,row['id']) for row in rows[start:]])
-            failures+=len(rows[start:])
-            break
+            data=citation_transport.read_batch(['ARXIV:'+normalize_arxiv(r['external_id'][6:]) for r in batch],headers)
+            for row,result in zip(batch,data):save(row,result)
+        except Exception as exc:
+            # Isolate a bad paper/request; a single 400 must not discard the others.
+            if getattr(exc,'status',None)==400:
+                for index,row in enumerate(batch):
+                    try:
+                        data=citation_transport.read_batch(['ARXIV:'+normalize_arxiv(row['external_id'][6:])],headers)
+                        save(row,data[0])
+                    except Exception as single:
+                        failure(row,single)
+                        if getattr(single,'status',None)!=400:
+                            # Do not keep hitting a rate-limited/unavailable provider.
+                            for pending in batch[index+1:]+rows[start+len(batch):]:failure(pending,single,unattempted=True)
+                            stop_batch=True
+                            break
+            else:
+                for row in batch:failure(row,exc)
+                for row in rows[start+len(batch):]:failure(row,exc,unattempted=True)
+                break
+        if stop_batch:break
         if start+100<len(rows): time.sleep(2)
     edges=sync_library_references()
-    message=f'引用检查：更新 {updated} 篇，暂无数据 {missing} 篇，失败 {failures} 篇。成功后 7 天检查；暂无数据 1 天后重查；网络失败 3 小时后重试（限流时遵守来源等待时间）。'
-    return {'updated':updated,'not_indexed':missing,'failed':failures,'local_reference_edges':edges,'message':message}
+    message=f'引用检查：更新 {updated} 篇，暂未收录 {missing} 篇，失败或暂缓 {failures} 篇。成功后7天检查；暂未收录1天后重查；失败至少3小时后重试。点击查看逐篇结果。'
+    return {'updated':updated,'not_indexed':missing,'failed':failures,'local_reference_edges':edges,'message':message,'details':details}
+
 
 def reference_title_key(text):
     text=re.sub(r'(?<=\w)-\s*\n\s*(?=\w)', '', text)
@@ -604,7 +648,7 @@ def citations(iid):
     data=getjson('https://api.semanticscholar.org/graph/v1/paper/'+urllib.parse.quote(key,safe='')+'?fields='+fields,headers)
     # Only actual reference identifiers create edges. Missing references never mean no citations.
     with conn() as c:
-        c.execute('UPDATE items SET citations=?,citation_source=?,citation_updated=?,citation_checked=?,citation_error=?,citation_retry_at='' WHERE id=?',(data.get('citationCount'),'Semantic Scholar',now(),now(),'',iid))
+        c.execute("UPDATE items SET citations=?,citation_source=?,citation_updated=?,citation_checked=?,citation_error=?,citation_retry_at='' WHERE id=?",(data.get('citationCount'),'Semantic Scholar',now(),now(),'',iid))
         c.execute("DELETE FROM edges WHERE src=? AND relation='cites' AND evidence LIKE 'Semantic Scholar%'",(iid,))
         count=0
         for ref in data.get('references') or []:
@@ -684,7 +728,7 @@ def resolve_author_alias(aid):
             aid=row[0]
     return aid
 
-def resolve_author_alias(alias_map, author_id):
+def resolve_alias_chain(alias_map, author_id):
     """Follow alias -> canonical hops; return (canonical, chain). Cycles are cut at the repeat."""
     chain=[]
     while author_id in alias_map and author_id not in chain:
@@ -700,7 +744,7 @@ def merge_authors(data):
         known={r['id'] for r in c.execute('SELECT id FROM profiles')}
         if source not in known or target not in known: raise ValueError('作者不存在，请刷新后重试')
         alias_map={r['alias']:r['canonical'] for r in c.execute('SELECT alias,canonical FROM author_aliases')}
-        canonical,chain=resolve_author_alias(alias_map,target)
+        canonical,chain=resolve_alias_chain(alias_map,target)
         if canonical==source or source in chain: raise ValueError('两位作者互相指向，无法合并')
         # Re-point aliases that pointed at the merged author, then record the merge itself.
         c.execute('UPDATE author_aliases SET canonical=? WHERE canonical=?',(target,source))

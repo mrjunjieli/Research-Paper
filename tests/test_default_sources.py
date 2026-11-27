@@ -32,7 +32,7 @@ class DefaultSourceTests(unittest.TestCase):
         self.check_migration('''
 engine.init()
 with engine.conn() as c:
-    rows=[dict(r) for r in c.execute("SELECT * FROM sources WHERE workspace='research'")]
+    rows=[dict(r) for r in c.execute("SELECT * FROM sources WHERE workspace='research' AND type!='followed'")]
 assert sorted(r['type'] for r in rows)==['alphaxiv','arxiv','hf'], rows
 assert len(hf())==1 and hf()[0]['query']=='daily'
 assert hf()[0]['enabled']==1 and hf()[0]['source_group']=='hot' and hf()[0]['kind']=='paper'
