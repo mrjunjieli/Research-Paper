@@ -1,0 +1,8 @@
+/* Compact session-only undo/redo controls, independent of save actions. */
+.edit-history-tools {grid-column:1 / -1;display:flex;align-items:center;justify-content:flex-end;gap:6px;flex-wrap:wrap;margin:8px 0 12px;}
+.edit-history-tools button {display:inline-flex;align-items:center;gap:5px;width:auto;min-width:0;min-height:32px;margin:0;padding:5px 10px;border:1px solid #d8dce2;border-radius:7px;background:transparent;box-shadow:none;color:#39485b;font:500 13px/1.5 system-ui,sans-serif;cursor:pointer;}
+.edit-history-tools button:hover:not(:disabled) {background:#edf1f7;border-color:#9baec7;}
+.edit-history-tools button:focus-visible {outline:2px solid #2a4d85;outline-offset:2px;}
+.edit-history-tools button:disabled {opacity:.38;cursor:default;}
+.edit-history-tools button > span[aria-hidden] {font-size:18px;line-height:1;}
+@media print {.edit-history-tools {display:none!important;}}

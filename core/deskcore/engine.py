@@ -352,6 +352,8 @@ def init():
         c.execute('PRAGMA optimize')
     with conn() as c:migrate_broad_topics(c)
     with conn() as c:c.execute('CREATE TABLE IF NOT EXISTS favorite_folders(id TEXT PRIMARY KEY,name TEXT NOT NULL,name_key TEXT UNIQUE NOT NULL,created TEXT NOT NULL)')
+    from deskcore import folder_ideas
+    folder_ideas.init(conn)
     ENRICH.initialize(enrichment_desk())
     with conn() as c:c.execute("CREATE TABLE IF NOT EXISTS paper_work(item TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER DEFAULT 0, updated TEXT NOT NULL, retry_at TEXT DEFAULT '', error TEXT DEFAULT '', PRIMARY KEY(item,kind))")
     migrate_screening_cache()

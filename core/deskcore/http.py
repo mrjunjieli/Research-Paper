@@ -5,7 +5,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 from deskcore.engine import *
-from deskcore import hooks
+from deskcore import hooks, folder_ideas
 
 CORE_STATIC = Path(__file__).resolve().parent / 'static'
 
@@ -56,6 +56,10 @@ class Handler(BaseHTTPRequestHandler):
             if path.path=='/api/todo-reminders':return self.reply(REMINDERS.read(enrichment_desk()))
             if path.path=='/api/experiments':return self.reply(EXPERIMENTS.read(enrichment_desk(),q.get('day',[''])[0]))
             if path.path=='/api/tasks':return self.reply(task_center())
+            if path.path=='/api/folder-ideas':
+                if workspace!='research':raise ValueError('研究想法仅适用于论文收藏夹')
+                try:return self.reply(folder_ideas.read(conn,q.get('folder_id',[''])[0]))
+                except ValueError as exc:return self.reply({'error':str(exc)},400)
             if path.path=='/api/paper-note':
                 if workspace!='research':raise ValueError('笔记仅适用于论文')
                 return self.reply(paper_note(q.get('id',[''])[0]))
@@ -126,6 +130,10 @@ class Handler(BaseHTTPRequestHandler):
             if path=='/api/research-directions/refresh':
                 if workspace!='research':raise ValueError('Research workspace required')
                 return self.reply(enqueue_direction_refresh())
+            if path=='/api/folder-ideas':
+                if workspace!='research':raise ValueError('研究想法仅适用于论文收藏夹')
+                result,status=folder_ideas.save(conn,v)
+                return self.reply(result,status)
             if path=='/api/paper-note':
                 if workspace!='research':raise ValueError('笔记仅适用于论文')
                 if not isinstance(v.get('content'),str):raise ValueError('笔记内容无效')

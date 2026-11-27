@@ -1,0 +1,16 @@
+.folder-ideas {margin:16px 0 22px;padding:20px 24px;background:var(--surface,#fff);border:1px solid #dfe3e8;border-radius:14px;}
+.folder-ideas-head {display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;}
+.folder-ideas h3 {font:600 18px/1.5 system-ui,sans-serif;margin:0;overflow-wrap:anywhere;}
+.folder-ideas p {margin:6px 0 12px;color:#747f8d;font-size:13px;line-height:1.6;}
+.folder-ideas textarea {display:block;width:100%;box-sizing:border-box;min-height:130px;max-height:65vh;resize:vertical;padding:14px;font:15px/1.8 system-ui,sans-serif;}
+.folder-ideas-status {font-size:12px;color:#747f8d;}
+.folder-ideas-status.is-error {color:#ae4138;}
+.folder-ideas .edit-history-tools {margin:0 0 8px;}
+.folder-ideas-retry {margin-top:8px;font-size:13px;}
+.folder-ideas [hidden] {display:none!important;}
+@media(max-width:640px){.folder-ideas {padding:16px;}}
+
+.folder-ideas-actions {display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.folder-ideas-actions button {min-height:34px;padding:6px 14px;font-size:13px;}
+.folder-ideas textarea[readonly] {background:#f8f9fb;color:#485364;caret-color:transparent;}
+.folder-ideas .folder-ideas-mode {margin:8px 0 0;font-size:12px;}
